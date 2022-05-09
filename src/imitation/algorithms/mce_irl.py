@@ -5,7 +5,8 @@ Follows the description in chapters 9 and 10 of Brian Ziebart's `PhD thesis`_.
 .. _PhD thesis:
     http://www.cs.cmu.edu/~bziebart/publications/thesis-bziebart.pdf
 """
-
+import collections
+import warnings
 from typing import Any, Iterable, Mapping, Optional, Tuple, Type, Union
 
 import gym
@@ -19,7 +20,7 @@ from imitation.data import rollout, types
 from imitation.envs import resettable_env
 from imitation.rewards import reward_nets
 from imitation.util import logger as imit_logger
-from imitation.util import util
+from imitation.util import networks, util
 
 
 def mce_partition_fh(
@@ -94,10 +95,10 @@ def mce_occupancy_measures(
         discount: rate to discount the cumulative occupancy measure D.
 
     Returns:
-        Tuple of D (ndarray) and Dt (ndarray). D is an :math:`|S|`-dimensional vector
-        recording the expected discounted number of times each state is visited. Dt is
-        a :math:`T*|S|`-dimensional vector recording the probability of being in a given
-        state at a given timestep.
+        Tuple of ``D`` (ndarray) and ``Dcum`` (ndarray). ``D`` is of shape
+        ``(env.horizon, env.n_states)`` and records the probability of being in a
+        given state at a given timestep. ``Dcum`` is of shape ``(env.n_states,)``
+        and records the expected discounted number of times each state is visited.
     """
     # shorthand
     horizon = env.horizon
@@ -109,12 +110,12 @@ def mce_occupancy_measures(
     if pi is None:
         _, _, pi = mce_partition_fh(env, reward=reward)
 
-    D = np.zeros((horizon, n_states))
+    D = np.zeros((horizon + 1, n_states))
     D[0, :] = env.initial_state_dist
-    for t in range(1, horizon):
+    for t in range(horizon):
         for a in range(n_actions):
-            E = D[t - 1] * pi[t - 1, :, a]
-            D[t, :] += E @ T[:, a, :]
+            E = D[t] * pi[t, :, a]
+            D[t + 1, :] += E @ T[:, a, :]
 
     Dcum = rollout.discounted_sum(D, discount)
     assert isinstance(Dcum, np.ndarray)
@@ -162,6 +163,7 @@ class TabularPolicy(policies.BasePolicy):
         # What we call state space here is observation space in SB3 nomenclature.
         super().__init__(observation_space=state_space, action_space=action_space)
         self.rng = rng or np.random
+        self.pi = None
         self.set_pi(pi)
 
     def set_pi(self, pi: np.ndarray) -> None:
@@ -251,10 +253,10 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         self,
         demonstrations: Optional[MCEDemonstrations],
         env: resettable_env.TabularModelEnv,
-        reward_net: Optional[reward_nets.RewardNet] = None,
+        reward_net: reward_nets.RewardNet,
         optimizer_cls: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Mapping[str, Any]] = None,
-        discount: float = 1,
+        discount: float = 1.0,
         linf_eps: float = 1e-3,
         grad_l2_eps: float = 1e-4,
         # TODO(adam): do we need log_interval or can just use record_mean...?
@@ -299,15 +301,6 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
             custom_logger=custom_logger,
         )
 
-        if reward_net is None:
-            reward_net = reward_nets.BasicRewardNet(
-                self.env.pomdp_observation_space,
-                self.env.action_space,
-                use_action=False,
-                use_next_state=False,
-                use_done=False,
-                hid_sizes=[],
-            )
         self.reward_net = reward_net
         optimizer_kwargs = optimizer_kwargs or {"lr": 1e-2}
         self.optimizer = optimizer_cls(reward_net.parameters(), **optimizer_kwargs)
@@ -329,49 +322,139 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
             rng=self.rng,
         )
 
-    def _set_demo_from_obs(self, obses: np.ndarray) -> None:
-        if self.discount != 1.0:
-            raise ValueError(
-                "Cannot compute discounted OM from timeless Transitions.",
-            )
+    def _set_demo_from_trajectories(self, trajs: Iterable[types.Trajectory]) -> None:
+        self.demo_state_om = np.zeros((self.env.n_states,))
+        num_demos = 0
+        for traj in trajs:
+            cum_discount = 1.0
+            for obs in traj.obs:
+                self.demo_state_om[obs] += cum_discount
+                cum_discount *= self.discount
+            num_demos += 1
+        self.demo_state_om /= num_demos
+
+    def _set_demo_from_obs(
+        self,
+        obses: np.ndarray,
+        dones: Optional[np.ndarray],
+        next_obses: Optional[np.ndarray],
+    ) -> None:
+        self.demo_state_om = np.zeros((self.env.n_states,))
+
         for obs in obses:
             if isinstance(obs, th.Tensor):
-                obs = obs.numpy()
-            self.demo_state_om[obs.astype(bool)] += 1.0
+                obs = obs.item()  # must be scalar
+            self.demo_state_om[obs] += 1.0
+
+        # We assume the transitions were flattened from some trajectories,
+        # then possibly shuffled. So add next observations for terminal states,
+        # as they will not appear anywhere else; but ignore next observations
+        # for all other states as they occur elsewhere in dataset.
+        if next_obses is not None:
+            for done, obs in zip(dones, next_obses):
+                if isinstance(done, th.Tensor):
+                    done = done.item()  # must be scalar
+                    obs = obs.item()  # must be scalar
+                if done:
+                    self.demo_state_om[obs] += 1.0
+        else:
+            warnings.warn(
+                "Training MCEIRL with transitions that lack next observation."
+                "This will result in systematically wrong occupancy measure estimates.",
+            )
+
+        # Normalize occupancy measure estimates
+        self.demo_state_om *= (self.env.horizon + 1) / self.demo_state_om.sum()
 
     def set_demonstrations(self, demonstrations: MCEDemonstrations) -> None:
         if isinstance(demonstrations, np.ndarray):
             # Demonstrations are an occupancy measure
             assert demonstrations.ndim == 1
             self.demo_state_om = demonstrations
+            return
+
+        # Demonstrations are either trajectories or transitions;
+        # we must compute occupancy measure from this.
+        if isinstance(demonstrations, Iterable):
+            first_item = next(iter(demonstrations))
+            if isinstance(first_item, types.Trajectory):
+                self._set_demo_from_trajectories(demonstrations)
+                return
+
+        # Demonstrations are from some kind of transitions-like object. This does
+        # not contain timesteps, so can only compute OM when undiscounted.
+        if self.discount != 1.0:
+            raise ValueError(
+                "Cannot compute discounted OM from timeless Transitions.",
+            )
+
+        if isinstance(demonstrations, types.Transitions):
+            self._set_demo_from_obs(
+                demonstrations.obs,
+                demonstrations.dones,
+                demonstrations.next_obs,
+            )
+        elif isinstance(demonstrations, types.TransitionsMinimal):
+            self._set_demo_from_obs(demonstrations.obs, None, None)
+        elif isinstance(demonstrations, Iterable):
+            # Demonstrations are a Torch DataLoader or other Mapping iterable
+            # Collect them together into one big NumPy array. This is inefficient,
+            # we could compute the running statistics instead, but in practice do
+            # not expect large dataset sizes together with MCE IRL.
+            collated = collections.defaultdict(list)
+            for batch in demonstrations:
+                assert isinstance(batch, Mapping)
+                for k in ("obs", "dones", "next_obs"):
+                    if k in batch:
+                        collated[k].append(batch[k])
+            for k, v in collated.items():
+                collated[k] = np.concatenate(v)
+
+            assert "obs" in collated
+            for k, v in collated.items():
+                assert len(v) == len(collated["obs"]), k
+            self._set_demo_from_obs(
+                collated["obs"],
+                collated.get("dones"),
+                collated.get("next_obs"),
+            )
         else:
-            # Demonstrations are either trajectories or transitions;
-            # we must compute occupancy measure from this.
-            self.demo_state_om = np.zeros((self.env.n_states,))
+            raise TypeError(
+                f"Unsupported demonstration type {type(demonstrations)}",
+            )
 
-            if isinstance(demonstrations, Iterable):
-                first_item = next(iter(demonstrations))
-                if isinstance(first_item, types.Trajectory):
-                    # Demonstrations are trajectories.
-                    for traj in demonstrations:
-                        # TODO(adam): vectorize?
-                        cum_discount = 1
-                        for obs in traj.obs:
-                            self.demo_state_om[obs.astype(bool)] += cum_discount
-                            cum_discount *= self.discount
-                else:
-                    # Demonstrations are a Torch DataLoader or other Mapping iterable
-                    for batch in demonstrations:
-                        self._set_demo_from_obs(batch["obs"])
+    def _train_step(self, obs_mat: th.Tensor):
+        self.optimizer.zero_grad()
 
-            elif isinstance(demonstrations, types.TransitionsMinimal):
-                self._set_demo_from_obs(demonstrations.obs)
-            else:
-                raise TypeError(
-                    f"Unsupported demonstration type {type(demonstrations)}",
-                )
+        # get reward predicted for each state by current model, & compute
+        # expected # of times each state is visited by soft-optimal policy
+        # w.r.t that reward function
+        # TODO(adam): support not just state-only reward?
+        predicted_r = squeeze_r(self.reward_net(obs_mat, None, None, None))
+        assert predicted_r.shape == (obs_mat.shape[0],)
+        predicted_r_np = predicted_r.detach().cpu().numpy()
+        _, visitations = mce_occupancy_measures(
+            self.env,
+            reward=predicted_r_np,
+            discount=self.discount,
+        )
 
-            self.demo_state_om /= self.demo_state_om.sum()  # normalize
+        # Forward/back/step (grads are zeroed at the top).
+        # weights_th(s) = \pi(s) - D(s)
+        weights_th = th.as_tensor(
+            visitations - self.demo_state_om,
+            dtype=self.reward_net.dtype,
+            device=self.reward_net.device,
+        )
+        # The "loss" is then:
+        #   E_\pi[r_\theta(S)] - E_D[r_\theta(S)]
+        loss = th.dot(weights_th, predicted_r)
+        # This gives the required gradient:
+        #   E_\pi[\nabla r_\theta(S)] - E_D[\nabla r_\theta(S)].
+        loss.backward()
+        self.optimizer.step()
+
+        return predicted_r_np, visitations
 
     def train(self, max_iter: int = 1000) -> np.ndarray:
         """Runs MCE IRL.
@@ -386,62 +469,35 @@ class MCEIRL(base.DemonstrationAlgorithm[types.TransitionsMinimal]):
         """
         # use the same device and dtype as the rmodel parameters
         obs_mat = self.env.observation_matrix
-        dtype = self.reward_net.dtype
-        device = self.reward_net.device
         torch_obs_mat = th.as_tensor(
             obs_mat,
-            dtype=dtype,
-            device=device,
+            dtype=self.reward_net.dtype,
+            device=self.reward_net.device,
         )
         assert self.demo_state_om.shape == (len(obs_mat),)
 
-        for t in range(max_iter):
-            self.optimizer.zero_grad()
+        with networks.training(self.reward_net):
+            # switch to training mode (affects dropout, normalization)
+            for t in range(max_iter):
+                predicted_r_np, visitations = self._train_step(torch_obs_mat)
 
-            # get reward predicted for each state by current model, & compute
-            # expected # of times each state is visited by soft-optimal policy
-            # w.r.t that reward function
-            # TODO(adam): support not just state-only reward?
-            predicted_r = squeeze_r(self.reward_net(torch_obs_mat, None, None, None))
-            assert predicted_r.shape == (obs_mat.shape[0],)
-            predicted_r_np = predicted_r.detach().cpu().numpy()
-            _, visitations = mce_occupancy_measures(
-                self.env,
-                reward=predicted_r_np,
-                discount=self.discount,
-            )
+                # these are just for termination conditions & debug logging
+                grad_norm = util.tensor_iter_norm(
+                    p.grad for p in self.reward_net.parameters()
+                ).item()
+                linf_delta = np.max(np.abs(self.demo_state_om - visitations))
 
-            # Forward/back/step (grads are zeroed at the top).
-            # weights_th(s) = \pi(s) - D(s)
-            weights_th = th.as_tensor(
-                visitations - self.demo_state_om,
-                dtype=dtype,
-                device=device,
-            )
-            # The "loss" is then:
-            #   E_\pi[r_\theta(S)] - E_D[r_\theta(S)]
-            loss = th.dot(weights_th, predicted_r)
-            # This gives the required gradient:
-            #   E_\pi[\nabla r_\theta(S)] - E_D[\nabla r_\theta(S)].
-            loss.backward()
-            self.optimizer.step()
+                if self.log_interval is not None and 0 == (t % self.log_interval):
+                    params = self.reward_net.parameters()
+                    weight_norm = util.tensor_iter_norm(params).item()
+                    self.logger.record("iteration", t)
+                    self.logger.record("linf_delta", linf_delta)
+                    self.logger.record("weight_norm", weight_norm)
+                    self.logger.record("grad_norm", grad_norm)
+                    self.logger.dump(t)
 
-            # these are just for termination conditions & debug logging
-            grad_norm = util.tensor_iter_norm(
-                p.grad for p in self.reward_net.parameters()
-            ).item()
-            linf_delta = np.max(np.abs(self.demo_state_om - visitations))
-
-            if self.log_interval is not None and 0 == (t % self.log_interval):
-                weight_norm = util.tensor_iter_norm(self.reward_net.parameters()).item()
-                self.logger.record("iteration", t)
-                self.logger.record("linf_delta", linf_delta)
-                self.logger.record("weight_norm", weight_norm)
-                self.logger.record("grad_norm", grad_norm)
-                self.logger.dump(t)
-
-            if linf_delta <= self.linf_eps or grad_norm <= self.grad_l2_eps:
-                break
+                if linf_delta <= self.linf_eps or grad_norm <= self.grad_l2_eps:
+                    break
 
         _, _, pi = mce_partition_fh(
             self.env,

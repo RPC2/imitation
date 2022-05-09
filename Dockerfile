@@ -2,7 +2,7 @@
 
 # base stage contains just binary dependencies.
 # This is used in the CI build.
-FROM nvidia/cuda:10.0-cudnn7-runtime-ubuntu18.04 AS base
+FROM nvidia/cuda:11.6.2-cudnn8-runtime-ubuntu20.04 AS base
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -q \
@@ -17,8 +17,8 @@ RUN apt-get update -q \
     libosmesa6-dev \
     net-tools \
     parallel \
-    python3.7 \
-    python3.7-dev \
+    python3.8 \
+    python3.8-dev \
     python3-pip \
     rsync \
     software-properties-common \
@@ -27,18 +27,16 @@ RUN apt-get update -q \
     virtualenv \
     xpra \
     xserver-xorg-dev \
+    patchelf  \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -o /usr/local/bin/patchelf https://s3-us-west-2.amazonaws.com/openai-sci-artifacts/manual-builds/patchelf_0.9_amd64.elf \
-    && chmod +x /usr/local/bin/patchelf
 
 ENV LANG C.UTF-8
 
 RUN    mkdir -p /root/.mujoco \
     && curl -o mjpro150.zip https://www.roboti.us/download/mjpro150_linux.zip \
     && unzip mjpro150.zip -d /root/.mujoco \
-    && rm mjpro150.zip
+    && rm mjpro150.zip && curl -o /root/.mujoco/mjkey.txt https://www.roboti.us/file/mjkey.txt
 
 # Set the PATH to the venv before we create the venv, so it's visible in base.
 # This is since we may create the venv outside of Docker, e.g. in CI
@@ -62,10 +60,8 @@ WORKDIR /imitation
 COPY ./setup.py ./setup.py
 COPY ./README.md ./README.md
 COPY ./src/imitation/__init__.py ./src/imitation/__init__.py
-COPY ./ci/build_venv.sh ./ci/build_venv.sh
-# mjkey.txt needs to exist for build, but doesn't need to be a real key
-RUN    touch /root/.mujoco/mjkey.txt \
-    && ci/build_venv.sh /venv \
+COPY ci/build_and_activate_venv.sh ./ci/build_and_activate_venv.sh
+RUN    ci/build_and_activate_venv.sh /venv \
     && rm -rf $HOME/.cache/pip
 
 # full stage contains everything.

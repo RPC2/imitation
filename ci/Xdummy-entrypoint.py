@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 # Adapted from https://github.com/openai/mujoco-py/blob/master/vendor/Xdummy-entrypoint
 # Copyright OpenAI; MIT License
@@ -29,11 +29,6 @@ if __name__ == "__main__":
             "/etc/dummy_xorg.conf",
             ":0",
         ]
-    )
-    subprocess.Popen(
-        ["nohup", "Xdummy"],
-        stdout=open("/dev/null", "w"),
-        stderr=open("/dev/null", "w"),
     )
     os.environ["DISPLAY"] = ":0"
 

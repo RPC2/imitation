@@ -260,7 +260,7 @@ AnyPolicy = Union[BaseAlgorithm, BasePolicy, PolicyCallable, None]
 def _policy_to_callable(
     policy: AnyPolicy,
     venv: VecEnv,
-    deterministic_policy: bool,
+    deterministic_policy: bool = False,
 ) -> PolicyCallable:
     """Converts any policy-like object into a function from observations to actions."""
     if policy is None:
@@ -285,6 +285,14 @@ def _policy_to_callable(
             return acts
 
     elif isinstance(policy, Callable):
+        # When a policy callable is passed, by default we will use it directly.
+        # We are not able to change the determinism of the policy when it is a
+        # callable that only takes in the states.
+        if deterministic_policy:
+            raise ValueError(
+                "Cannot set deterministic_policy=True when policy is a callable, "
+                "since deterministic_policy argument is ignored.",
+            )
         get_actions = policy
 
     else:
@@ -467,20 +475,6 @@ def rollout_stats(
     return out_stats
 
 
-def mean_return(*args, **kwargs) -> float:
-    """Find the mean return of a policy.
-
-    Args:
-        *args: Passed through to `generate_trajectories`.
-        **kwargs: Passed through to `generate_trajectories`.
-
-    Returns:
-        The mean return of the generated trajectories.
-    """
-    trajectories = generate_trajectories(*args, **kwargs)
-    return rollout_stats(trajectories)["return_mean"]
-
-
 def flatten_trajectories(
     trajectories: Sequence[types.Trajectory],
 ) -> types.Transitions:
@@ -568,8 +562,7 @@ def generate_transitions(
     return transitions
 
 
-def rollout_and_save(
-    path: str,
+def rollout(
     policy: AnyPolicy,
     venv: VecEnv,
     sample_until: GenTrajTerminationFn,
@@ -578,13 +571,12 @@ def rollout_and_save(
     exclude_infos: bool = True,
     verbose: bool = True,
     **kwargs,
-) -> None:
-    """Generate policy rollouts and save them to a pickled list of trajectories.
+) -> Sequence[types.TrajectoryWithRew]:
+    """Generate policy rollouts.
 
     The `.infos` field of each Trajectory is set to `None` to save space.
 
     Args:
-        path: Rollouts are saved to this path.
         policy: Can be any of the following:
             1) A stable_baselines3 policy or algorithm trained on the gym environment.
             2) A Callable that takes an ndarray of observations and returns an ndarray
@@ -600,6 +592,11 @@ def rollout_and_save(
             pickles.
         verbose: If True, then print out rollout stats before saving.
         **kwargs: Passed through to `generate_trajectories`.
+
+    Returns:
+        Sequence of trajectories, satisfying `sample_until`. Additional trajectories
+        may be collected to avoid biasing process towards short episodes; the user
+        should truncate if required.
     """
     trajs = generate_trajectories(policy, venv, sample_until, **kwargs)
     if unwrap:
@@ -609,8 +606,7 @@ def rollout_and_save(
     if verbose:
         stats = rollout_stats(trajs)
         logging.info(f"Rollout stats: {stats}")
-
-    types.save(path, trajs)
+    return trajs
 
 
 def discounted_sum(arr: np.ndarray, gamma: float) -> Union[np.ndarray, float]:

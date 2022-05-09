@@ -5,6 +5,7 @@ output/
 /data/
 auto.pkl
 /quickstart
+nohup.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

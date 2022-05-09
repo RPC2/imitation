@@ -7,7 +7,6 @@ import os
 from typing import (
     Callable,
     Iterable,
-    Iterator,
     Mapping,
     Optional,
     Sequence,
@@ -27,7 +26,7 @@ from torch.nn import functional as F
 from imitation.algorithms import base
 from imitation.data import buffer, rollout, types, wrappers
 from imitation.rewards import reward_nets, reward_wrapper
-from imitation.util import logger, util
+from imitation.util import logger, networks, util
 
 
 def compute_train_stats(
@@ -105,11 +104,6 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
     venv: vec_env.VecEnv
     """The original vectorized environment."""
 
-    venv_norm_obs: Optional[vec_env.VecEnv]
-    """Like `self.venv`, but wrapped with `VecNormalize` normalizing the observations.
-
-    These statistics must be saved along with the model."""
-
     venv_train: vec_env.VecEnv
     """Like `self.venv`, but wrapped with train reward unless in debug mode.
 
@@ -123,10 +117,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         demo_batch_size: int,
         venv: vec_env.VecEnv,
         gen_algo: base_class.BaseAlgorithm,
-        disc_parameters: Iterator[th.nn.Parameter],
+        reward_net: reward_nets.RewardNet,
         n_disc_updates_per_round: int = 2,
         log_dir: str = "output/",
-        normalize_obs: bool = True,
         normalize_reward: bool = True,
         normalize_reward_kwargs: Optional[dict] = None,
         disc_opt_cls: Type[th.optim.Optimizer] = th.optim.Adam,
@@ -155,11 +148,11 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             gen_algo: The generator RL algorithm that is trained to maximize
                 discriminator confusion. Environment and logger will be set to
                 `venv` and `custom_logger`.
-            disc_parameters: Discriminator parameters to optimize over.
+            reward_net: a Torch module that takes an observation, action and
+                next observation tensors as input and computes a reward signal.
             n_disc_updates_per_round: The number of discriminator updates after each
                 round of generator updates in AdversarialTrainer.learn().
             log_dir: Directory to store TensorBoard logs, plots, etc. in.
-            normalize_obs: Whether to normalize observations with `VecNormalize`.
             normalize_reward: Whether to normalize rewards with `VecNormalize`.
             normalize_reward_kwargs: kwargs to supply to `VecNormalize` when
                 constructing the reward normalization wrapper (these are not
@@ -213,6 +206,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         self.debug_use_ground_truth = debug_use_ground_truth
         self.venv = venv
         self.gen_algo = gen_algo
+        self._reward_net = reward_net.to(gen_algo.device)
         self._log_dir = log_dir
 
         # Create graph for optimising/recording stats on discriminator
@@ -221,7 +215,7 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         self._init_tensorboard = init_tensorboard
         self._init_tensorboard_graph = init_tensorboard_graph
         self._disc_opt = self._disc_opt_cls(
-            disc_parameters,
+            self._reward_net.parameters(),
             **self._disc_opt_kwargs,
         )
 
@@ -232,12 +226,6 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             self._summary_writer = thboard.SummaryWriter(summary_dir)
 
         venv = self.venv_buffering = wrappers.BufferingWrapper(self.venv)
-        self.venv_norm_obs = None
-        if normalize_obs:
-            venv = self.venv_norm_obs = vec_env.VecNormalize(
-                venv,
-                norm_reward=False,
-            )
 
         self.gen_callbacks = []
         if gen_callbacks:
@@ -493,7 +481,9 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
                 expected_total_timesteps=total_timesteps,
                 learn_kwargs=dict(dump_logs=log_interval_timesteps is None))
             for _ in range(self.n_disc_updates_per_round):
-                self.train_disc(dump_logs=log_interval_timesteps is None)
+                with networks.training(self.reward_train):
+                    # switch to training mode (affects dropout, normalization)
+                    self.train_disc()
             if callback:
                 callback(r)
             num_timesteps = self.gen_algo.num_timesteps
@@ -579,10 +569,6 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         labels_gen_is_one = np.concatenate(
             [np.zeros(n_expert, dtype=int), np.ones(n_gen, dtype=int)],
         )
-        # Policy and reward network were trained on normalized observations.
-        if self.venv_norm_obs is not None:
-            obs = self.venv_norm_obs.normalize_obs(obs)
-            next_obs = self.venv_norm_obs.normalize_obs(next_obs)
 
         # Calculate generator-policy log probabilities.
         with th.no_grad():
