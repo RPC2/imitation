@@ -120,8 +120,6 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         reward_net: reward_nets.RewardNet,
         n_disc_updates_per_round: int = 2,
         log_dir: str = "output/",
-        normalize_reward: bool = True,
-        normalize_reward_kwargs: Optional[dict] = None,
         disc_opt_cls: Type[th.optim.Optimizer] = th.optim.Adam,
         disc_opt_kwargs: Optional[Mapping] = None,
         gen_train_timesteps: Optional[int] = None,
@@ -153,11 +151,6 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
             n_disc_updates_per_round: The number of discriminator updates after each
                 round of generator updates in AdversarialTrainer.learn().
             log_dir: Directory to store TensorBoard logs, plots, etc. in.
-            normalize_reward: Whether to normalize rewards with `VecNormalize`.
-            normalize_reward_kwargs: kwargs to supply to `VecNormalize` when
-                constructing the reward normalization wrapper (these are not
-                passed when constructing the observation normalization
-                wrapper).
             disc_opt_cls: The optimizer for discriminator training.
             disc_opt_kwargs: Parameters for discriminator training.
             gen_train_timesteps: The number of steps to train the generator policy for
@@ -237,24 +230,10 @@ class AdversarialTrainer(base.DemonstrationAlgorithm[types.Transitions]):
         else:
             venv = self.venv_wrapped = reward_wrapper.RewardVecEnvWrapper(
                 venv,
-                self.reward_train.predict,
+                reward_fn=self.reward_train.predict_processed,
             )
             self.gen_callbacks.append(self.venv_wrapped.make_log_callback())
         self.venv_train = self.venv_wrapped
-        if normalize_reward:
-            if normalize_reward_kwargs is None:
-                normalize_reward_kwargs = {}
-            self.venv_train = vec_env.VecNormalize(
-                self.venv_wrapped,
-                norm_obs=False,
-                **normalize_reward_kwargs,
-            )
-        else:
-            assert normalize_reward_kwargs is None
-
-        if disc_augmentation_fn is None:
-            disc_augmentation_fn = util.identity
-        self.disc_augmentation_fn = disc_augmentation_fn
 
         self.gen_algo.set_env(self.venv_train)
         self.gen_algo.set_logger(self.logger)
