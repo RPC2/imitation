@@ -141,7 +141,8 @@ class AgentTrainer(TrajectoryGenerator):
         # NOTE: this has to come after setting self.algorithm because super().__init__
         # will set self.logger, which also sets the logger for the algorithm
         super().__init__(custom_logger)
-        if isinstance(reward_fn, reward_nets.RewardNet):
+        if isinstance(reward_fn, reward_nets.RewardNet) or \
+            isinstance(reward_fn, reward_nets.RewardNetWrapper):
             reward_fn = reward_fn.predict_processed
         self.reward_fn = reward_fn
         self.exploration_frac = exploration_frac
@@ -198,7 +199,7 @@ class AgentTrainer(TrajectoryGenerator):
         self.algorithm.learn(
             total_timesteps=steps,
             reset_num_timesteps=False,
-            callback=self.log_callback,
+            # callback=self.log_callback,
             **kwargs,
         )
 
@@ -746,9 +747,17 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         # common in some environments (as long as sample=False or temperature=0).
         # In a sense that "only" creates class imbalance
         # but it's still misleading.
-        predictions = (probs > 0.5).float()
+        # predictions = (probs > 0.5).float()
+        # preferences_th = th.as_tensor(preferences, dtype=th.float32)
+        # ground_truth = (preferences_th > 0.5).float()
+        # accuracy = (predictions == ground_truth).float().mean()
+        # self.logger.record("accuracy", accuracy.item())
+        # return th.nn.functional.binary_cross_entropy(probs, preferences_th)
+        predictions = (probs > 0.5).float().detach()
+        predictions[th.isclose(probs, th.tensor(0.5))] = 0.5
         preferences_th = th.as_tensor(preferences, dtype=th.float32)
         ground_truth = (preferences_th > 0.5).float()
+        ground_truth[th.isclose(ground_truth, th.tensor(0.5))] = 0.5
         accuracy = (predictions == ground_truth).float().mean()
         self.logger.record("accuracy", accuracy.item())
         return th.nn.functional.binary_cross_entropy(probs, preferences_th)
