@@ -63,7 +63,6 @@ setup(
         # If you change gym version here, change it in "mujoco" below too.
         # pinned to 0.21 until https://github.com/DLR-RM/stable-baselines3/pull/780
         # goes upstream.
-        "gym[classic_control]==0.21.0",
         "matplotlib",
         "numpy>=1.15",
         "torch>=1.4.0",
@@ -99,9 +98,6 @@ setup(
         "test": TESTS_REQUIRE,
         "docs": DOCS_REQUIRE,
         "parallel": PARALLEL_REQUIRE,
-        "mujoco": [
-            "gym[mujoco]~=0.21.0",
-        ],
     },
     entry_points={
         "console_scripts": [
