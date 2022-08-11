@@ -100,7 +100,7 @@ setup(
         "docs": DOCS_REQUIRE,
         "parallel": PARALLEL_REQUIRE,
         "mujoco": [
-            "gym[classic_control,mujoco]==0.21.0",
+            "gym[mujoco]~=0.21.0",
         ],
     },
     entry_points={
