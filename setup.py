@@ -39,6 +39,7 @@ DOCS_REQUIRE = [
     "sphinx-rtd-theme",
     "sphinxcontrib-napoleon",
 ]
+PARALLEL_REQUIRE = ["ray[debug,tune]>=0.8.7,<0.9.0"]
 
 
 def get_readme() -> str:
@@ -62,7 +63,6 @@ setup(
         # If you change gym version here, change it in "mujoco" below too.
         # pinned to 0.21 until https://github.com/DLR-RM/stable-baselines3/pull/780
         # goes upstream.
-        "gym[classic_control]==0.21.0",
         "matplotlib",
         "numpy>=1.15",
         "torch>=1.4.0",
@@ -70,14 +70,11 @@ setup(
         "scikit-learn>=0.21.2",
         # TODO(adam): switch back to PyPi once following makes it to release:
         # https://github.com/DLR-RM/stable-baselines3/pull/734 is released
-        (
-            "stable-baselines3@git+https://github.com/carlosluis/stable-baselines3.git"
-            "@gym_fixes#egg=stable-baselines3"
-        ),
-        "stable-baselines3>=1.4.0",
+        "stable-baselines3",
         # TODO(nora) switch back to PyPi once 0.8.3 makes it to release:
         "sacred@git+https://github.com/IDSIA/sacred.git@0.8.3",
         "tensorboard>=1.14",
+        "kornia~=0.6.1",
     ],
     tests_require=TESTS_REQUIRE,
     extras_require={
@@ -97,9 +94,6 @@ setup(
         "test": TESTS_REQUIRE,
         "docs": DOCS_REQUIRE,
         "parallel": PARALLEL_REQUIRE,
-        "mujoco": [
-            "gym[classic_control,mujoco]==0.21.0",
-        ],
     },
     entry_points={
         "console_scripts": [

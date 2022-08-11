@@ -327,6 +327,7 @@ class NormalizedRewardNet(RewardNetWrapper):
         self,
         base: RewardNet,
         normalize_output_layer: Type[nn.Module],
+        normalize_layer_kwargs: dict = None,
     ):
         """Initialize the NormalizedRewardNet.
 
@@ -342,7 +343,8 @@ class NormalizedRewardNet(RewardNetWrapper):
         # shape of (N,C).
         super().__init__(base=base)
         # Assuming reward is scalar, norm layer should be initialized with shape (1,).
-        self.normalize_output_layer = normalize_output_layer(1)
+        self.normalize_output_layer = normalize_output_layer(1,
+                                                             **normalize_layer_kwargs)
 
     def predict_processed(
         self,
@@ -365,10 +367,14 @@ class NormalizedRewardNet(RewardNetWrapper):
         Returns:
             Computed normalized rewards of shape `(batch_size,`).
         """
-        with networks.evaluating(self):
-            # switch to eval mode (affecting normalization, dropout, etc)
-            rew_th = self.base.predict_th(state, action, next_state, done)
-            rew = self.normalize_output_layer(rew_th).detach().cpu().numpy().flatten()
+        if self.base.training:
+            rew_th = self.base(state, action, next_state, done)
+            rew = self.normalize_output_layer(rew_th)
+        else:
+            with networks.evaluating(self):
+                # switch to eval mode (affecting normalization, dropout, etc)
+                rew_th = self.base.predict_th(state, action, next_state, done)
+                rew = self.normalize_output_layer(rew_th).detach().cpu().numpy().flatten()
         if update_stats:
             with th.no_grad():
                 self.normalize_output_layer.update_stats(rew_th)

@@ -3,6 +3,7 @@
 import collections
 import contextlib
 import functools
+from abc import ABC, abstractclassmethod
 from typing import Iterable, Optional, Type
 
 import torch as th
@@ -44,14 +45,10 @@ class SqueezeLayer(nn.Module):
         return new_value
 
 
-class RunningNorm(nn.Module):
-    """Normalizes input to mean 0 and standard deviation 1 using a running average.
-
+class BaseNorm(nn.Module, ABC):
+    """Base class for layers that try to normalize the input to mean 0 and variance 1.
     Similar to BatchNorm, LayerNorm, etc. but whereas they only use statistics from
     the current batch at train time, we use statistics from all batches.
-
-    This should closely replicate the common practice in RL of normalizing environment
-    observations, such as using `VecNormalize` in Stable Baselines.
     """
 
     running_mean: th.Tensor
@@ -60,7 +57,6 @@ class RunningNorm(nn.Module):
 
     def __init__(self, num_features: int, eps: float = 1e-5):
         """Builds RunningNorm.
-
         Args:
             num_features: Number of features; the length of the non-batch dimension.
             eps: Small constant for numerical stability. Inputs are rescaled by
@@ -79,13 +75,36 @@ class RunningNorm(nn.Module):
         self.running_var.fill_(1)
         self.count.zero_()
 
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """Updates statistics if in training mode. Returns normalized `x`."""
+        if self.training:
+            # Do not backpropagate through updating running mean and variance.
+            # These updates are in-place and not differentiable. The gradient
+            # is not needed as the running mean and variance are updated
+            # directly by this function, and not by gradient descent.
+            with th.no_grad():
+                self.update_stats(x)
+
+        return (x - self.running_mean) / th.sqrt(self.running_var + self.eps)
+
+    @abstractclassmethod
+    def update_stats(self, batch: th.Tensor) -> None:
+        """Update `self.running_mean`, `self.running_var` and `self.count`."""
+
+
+class RunningNorm(BaseNorm):
+    """Normalizes input to mean 0 and standard deviation 1 using a running average.
+    Similar to BatchNorm, LayerNorm, etc. but whereas they only use statistics from
+    the current batch at train time, we use statistics from all batches.
+    This should closely replicate the common practice in RL of normalizing environment
+    observations, such as using `VecNormalize` in Stable Baselines.
+    """
+
     def update_stats(self, batch: th.Tensor) -> None:
         """Update `self.running_mean`, `self.running_var` and `self.count`.
-
         Uses Chan et al (1979), "Updating Formulae and a Pairwise Algorithm for
         Computing Sample Variances." to update the running moments in a numerically
         stable fashion.
-
         Args:
             batch: A batch of data to use to update the running mean and variance.
         """
@@ -104,17 +123,58 @@ class RunningNorm(nn.Module):
 
         self.count += batch_count
 
-    def forward(self, x: th.Tensor) -> th.Tensor:
-        """Updates statistics if in training mode. Returns normalized `x`."""
-        if self.training:
-            # Do not backpropagate through updating running mean and variance.
-            # These updates are in-place and not differentiable. The gradient
-            # is not needed as the running mean and variance are updated
-            # directly by this function, and not by gradient descent.
-            with th.no_grad():
-                self.update_stats(x)
 
-        return (x - self.running_mean) / th.sqrt(self.running_var + self.eps)
+class EMANorm(BaseNorm):
+    """Similar to RunningNorm but uses an exponential weighting."""
+
+    def __init__(
+        self,
+        num_features: int,
+        decay: float = 0.99,
+        eps: float = 1e-5,
+    ):
+        """Builds EMARunningNorm.
+        Args:
+            num_features: Number of features; the length of the non-batch dim.
+            decay: how quickly the weight on past samples decays over time
+            eps: small constant for for numerical stability.
+        Raises:
+            ValueError: if decay is out of range.
+        """
+        super().__init__(num_features, eps=eps)
+
+        if not 0 < decay < 1:
+            raise ValueError("decay must be between 0 and 1")
+
+        self.decay = decay
+
+    def update_stats(self, batch: th.Tensor) -> None:
+        """Update `self.running_mean` and `self.running_var`.
+        Reference Finch (2009), "Incremental calculation of weighted mean and variance".
+            (https://fanf2.user.srcf.net/hermes/doc/antiforgery/stats.pdf)
+        Args:
+            batch: A batch of data to use to update the running mean and variance.
+        """
+        b_size = batch.shape[0]
+
+        if self.count == 0:
+            self.running_mean = th.mean(batch, dim=0)
+            if b_size > 1:
+                self.running_var = th.var(batch, dim=0)
+        else:
+            # Shuffle the batch since we don't don't want to bias the mean
+            # towards data that appears latter in the batch
+            perm = th.randperm(b_size)
+
+            alpha = 1 - self.decay
+
+            for i in range(b_size):
+                diff = batch[perm[i], ...] - self.running_mean
+                incr = alpha * diff
+                self.running_mean += incr
+                self.running_var = self.decay * (self.running_var + diff * incr)
+
+        self.count += b_size
 
 
 def build_mlp(

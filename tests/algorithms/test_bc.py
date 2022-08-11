@@ -10,8 +10,17 @@ from torch.utils import data as th_data
 
 from imitation.algorithms import bc
 from imitation.data import rollout, types
-from imitation.testing import reward_improvement
-from imitation.util import logger
+from imitation.testing import counter, reward_improvement
+from imitation.util import logger, util
+
+ROLLOUT_PATH = "tests/testdata/expert_models/cartpole_0/rollouts/final.pkl"
+
+
+@pytest.fixture
+def venv():
+    env_name = "CartPole-v1"
+    venv = util.make_vec_env(env_name, 2)
+    return venv
 
 
 @pytest.fixture(params=[32, 50])
@@ -202,6 +211,21 @@ def test_save_reload(trainer, tmpdir):
     assert len(var_values) == len(new_values)
     for old, new in zip(var_values, new_values):
         assert th.allclose(old, new)
+
+
+def test_augment(venv):
+    rollouts = types.load(ROLLOUT_PATH)
+    data = rollout.flatten_trajectories(rollouts)
+    mock_augment = counter.IdentityCounter()
+    trainer = bc.BC(
+        observation_space=venv.observation_space,
+        action_space=venv.action_space,
+        demonstrations=data,
+        augmentation_fn=mock_augment,
+    )
+    assert mock_augment.ncalls == 0
+    trainer.train(n_epochs=1)
+    assert mock_augment.ncalls > 0
 
 
 def test_train_progress_bar_visibility(trainer: bc.BC):

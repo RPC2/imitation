@@ -4,6 +4,7 @@ import datetime
 import functools
 import itertools
 import os
+import seals
 import uuid
 from typing import (
     Any,
@@ -21,6 +22,7 @@ import gym
 import numpy as np
 import torch as th
 from gym.wrappers import TimeLimit
+from scipy import stats
 from stable_baselines3.common import monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 
@@ -40,6 +42,7 @@ def make_vec_env(
     parallel: bool = False,
     log_dir: Optional[str] = None,
     max_episode_steps: Optional[int] = None,
+    wrapper_class: Optional[Callable] = None,
     post_wrappers: Optional[Sequence[Callable[[gym.Env, int], gym.Env]]] = None,
     env_make_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> VecEnv:
@@ -57,6 +60,8 @@ def make_vec_env(
             `max_episode_steps` for every TimeLimit wrapper (this automatic
             wrapper is the default behavior when calling `gym.make`). Otherwise
             the environments are passed into the VecEnv unwrapped.
+        wrapper_class: A wrapper class to apply to all sub-environments. This
+            is applied after the Monitor, but before the RolloutInfoWrapper.
         post_wrappers: If specified, iteratively wraps each environment with each
             of the wrappers specified in the sequence. The argument should be a Callable
             accepting two arguments, the Env to be wrapped and the environment index,
@@ -101,6 +106,9 @@ def make_vec_env(
             log_path = os.path.join(log_subdir, f"mon{i:03d}")
 
         env = monitor.Monitor(env, log_path)
+        if wrapper_class is not None:
+            # we apply this after Monitor, just like cmd_util.make_vec_env in SB3
+            env = wrapper_class(env)
 
         if post_wrappers:
             for wrapper in post_wrappers:
@@ -113,7 +121,9 @@ def make_vec_env(
     env_fns = [functools.partial(make_env, i, s) for i, s in enumerate(env_seeds)]
     if parallel:
         # See GH hill-a/stable-baselines issue #217
-        return SubprocVecEnv(env_fns, start_method="forkserver")
+        return SubprocVecEnv(
+            env_fns, start_method="forkserver"
+        )
     else:
         return DummyVecEnv(env_fns)
 
@@ -129,6 +139,11 @@ def docstring_parameter(*args, **kwargs):
 
 
 T = TypeVar("T")
+
+
+def identity(x: T) -> T:
+    """Identity function."""
+    return x
 
 
 def endless_iter(iterable: Iterable[T]) -> Iterator[T]:
@@ -158,6 +173,52 @@ def endless_iter(iterable: Iterable[T]) -> Iterator[T]:
         raise ValueError(f"iterable {iterable} had no elements to iterate over.")
 
     return itertools.chain.from_iterable(itertools.repeat(iterable))
+
+
+def optim_lr_gmean(optimizer: th.optim.Optimizer) -> float:
+    """Compute geometric mean of learning rates across all the optimizer's
+    parameter groups.
+
+    Args:
+        optimizer (torch.optim.Optimizer): a Torch optimizer.
+
+    Returns:
+        Geometric mean of the learning rates across all parameter
+        groups.
+
+    Raises:
+        ValueError: if there are no parameter groups attached to the
+            optimizer."""
+    lrs = []
+    for param_group in optimizer.param_groups:
+        lrs.append(param_group["lr"])
+    if len(lrs) == 0:
+        raise ValueError(f"No parameter groups for optimizer {optimizer}")
+    if len(set(lrs)) == 1:
+        # special-case logic: don't do geometric mean (with associated
+        # imprecision) if we can just return one value instead
+        return lrs[0]
+    # otherwise, do geometric mean
+    return stats.gmean(lrs)
+
+
+def join_callbacks(*callbacks: Optional[Callable[..., None]]) -> Callable[..., None]:
+    """Call a series of callbacks in sequence.
+
+    Args:
+        callbacks: series of functions (or None values) to call. Any callback
+            that is None will be ignored.
+
+    Returns:
+        A 'joined' callback that executes each of the functions in
+        `callbacks` in sequence with the supplied arguments."""
+
+    def joined_callback(*args, **kwargs):
+        for callback in callbacks:
+            if callback is not None:
+                callback(*args, **kwargs)
+
+    return joined_callback
 
 
 def tensor_iter_norm(

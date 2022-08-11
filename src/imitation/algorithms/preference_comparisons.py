@@ -5,6 +5,7 @@ between trajectory fragments.
 """
 import abc
 import math
+import wandb
 import pickle
 import random
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -141,7 +142,8 @@ class AgentTrainer(TrajectoryGenerator):
         # NOTE: this has to come after setting self.algorithm because super().__init__
         # will set self.logger, which also sets the logger for the algorithm
         super().__init__(custom_logger)
-        if isinstance(reward_fn, reward_nets.RewardNet):
+        if isinstance(reward_fn, reward_nets.RewardNet) or \
+            isinstance(reward_fn, reward_nets.RewardNetWrapper):
             reward_fn = reward_fn.predict_processed
         self.reward_fn = reward_fn
         self.exploration_frac = exploration_frac
@@ -677,6 +679,8 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         threshold: float = 50,
         weight_decay: float = 0.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+        binary_label: Optional[bool] = False,
+        regression_loss: Optional[bool] = False,
     ):
         """Initialize the reward model trainer.
 
@@ -704,6 +708,7 @@ class CrossEntropyRewardTrainer(RewardTrainer):
                 to use with ``th.optim.AdamW``. This is similar to but not equivalent
                 to L2 regularization, see https://arxiv.org/abs/1711.05101
             custom_logger: Where to log to; if None (default), creates a new logger.
+            binary_label: Whether we allow 0.5 (equal preference) to be a label.
         """
         super().__init__(model, custom_logger)
         self.noise_prob = noise_prob
@@ -716,11 +721,14 @@ class CrossEntropyRewardTrainer(RewardTrainer):
             lr=lr,
             weight_decay=weight_decay,
         )
+        self.binary_label = binary_label
+        self.regression_loss = regression_loss
 
     def _loss(
         self,
         fragment_pairs: Sequence[TrajectoryPair],
         preferences: np.ndarray,
+        train_stage: Optional[str] = 'train'
     ) -> th.Tensor:
         """Computes the loss.
 
@@ -734,24 +742,57 @@ class CrossEntropyRewardTrainer(RewardTrainer):
             reward model and the target probabilities in `preferences`.
         """
         probs = th.empty(len(fragment_pairs), dtype=th.float32)
+        true_rew, pred_rew = [], []
         for i, fragment in enumerate(fragment_pairs):
             frag1, frag2 = fragment
             trans1 = rollout.flatten_trajectories([frag1])
             trans2 = rollout.flatten_trajectories([frag2])
             rews1 = self._rewards(trans1)
             rews2 = self._rewards(trans2)
-            probs[i] = self._probability(rews1, rews2)
-        # TODO(ejnnr): Here and below, > 0.5 is problematic
-        # because getting exactly 0.5 is actually somewhat
-        # common in some environments (as long as sample=False or temperature=0).
-        # In a sense that "only" creates class imbalance
-        # but it's still misleading.
-        predictions = (probs > 0.5).float()
-        preferences_th = th.as_tensor(preferences, dtype=th.float32)
-        ground_truth = (preferences_th > 0.5).float()
-        accuracy = (predictions == ground_truth).float().mean()
-        self.logger.record("accuracy", accuracy.item())
-        return th.nn.functional.binary_cross_entropy(probs, preferences_th)
+            if self.regression_loss:
+                true_rew1, true_rew2 = th.tensor(frag1.rews), th.tensor(frag2.rews)
+                true_rew.append(th.sum(true_rew1, dim=0))
+                true_rew.append(th.sum(true_rew2, dim=0))
+                pred_rew.append(th.sum(rews1, dim=0))
+                pred_rew.append(th.sum(rews2, dim=0))
+            else:
+                probs[i] = self._probability(rews1, rews2)
+        
+        if self.regression_loss:
+            rollout_len = len(frag1)
+            pred_rew = th.stack(pred_rew)
+            pred_rew = pred_rew / rollout_len * 10
+            pred_rew = th.clip(pred_rew, 0.001, 100)
+            true_rew = th.stack(true_rew).to(pred_rew.device).to(th.float32)
+            true_rew = true_rew / rollout_len * 10
+            true_rew = th.clip(true_rew, 0.001, 100)
+            assert all(th.isfinite(pred_rew))
+            assert all(th.isfinite(true_rew))
+            loss = th.nn.functional.mse_loss(true_rew, pred_rew)
+            return loss
+
+        if self.binary_label:
+            # TODO(ejnnr): Here and below, > 0.5 is problematic
+            # because getting exactly 0.5 is actually somewhat
+            # common in some environments (as long as sample=False or temperature=0).
+            # In a sense that "only" creates class imbalance
+            # but it's still misleading.
+            predictions = (probs > 0.5).float()
+            preferences_th = th.as_tensor(preferences, dtype=th.float32)
+            ground_truth = (preferences_th > 0.5).float()
+            accuracy = (predictions == ground_truth).float().mean()
+            self.logger.record(f"{train_stage}_accuracy", accuracy.item())
+            return th.nn.functional.binary_cross_entropy(probs, preferences_th)
+        else:
+            predictions = (probs > 0.5).float().detach()
+            predictions[th.isclose(probs, th.tensor(0.5))] = 0.5
+            preferences_th = th.as_tensor(preferences, dtype=th.float32)
+            ground_truth = (preferences_th > 0.5).float()
+            ground_truth[th.isclose(ground_truth, th.tensor(0.5))] = 0.5
+            accuracy = (predictions == ground_truth).float().mean()
+            self.logger.record(f"{train_stage}_accuracy", accuracy.item())
+            loss = th.nn.functional.binary_cross_entropy(probs, preferences_th)
+            return loss
 
     def _rewards(self, transitions: Transitions) -> th.Tensor:
         preprocessed = self.model.preprocess(
@@ -805,13 +846,27 @@ class CrossEntropyRewardTrainer(RewardTrainer):
             collate_fn=preference_collate_fn,
         )
         epochs = round(self.epochs * epoch_multiplier)
-        for _ in range(epochs):
+        for epoch in range(epochs):
             for fragment_pairs, preferences in dataloader:
                 self.optim.zero_grad()
                 loss = self._loss(fragment_pairs, preferences)
                 loss.backward()
                 self.optim.step()
-                self.logger.record("loss", loss.item())
+                self.logger.record("train_loss", loss.item())
+
+    def test(self, dataset: PreferenceDataset):
+        dataloader = th.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=preference_collate_fn,
+        )
+        for fragment_pairs, preferences in dataloader:
+            with th.no_grad():
+                loss = self._loss(fragment_pairs,
+                                  preferences,
+                                  train_stage='test')
+            self.logger.record("test_loss", loss.item())
 
 
 class PreferenceComparisons(base.BaseImitationAlgorithm):
@@ -829,9 +884,14 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         transition_oversampling: float = 1,
         initial_comparison_frac: float = 0.1,
         initial_epoch_multiplier: float = 200.0,
+        epoch_multiplier: float = 1.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
         allow_variable_horizon: bool = False,
         seed: Optional[int] = None,
+        full_dataset_train: Optional[bool] = False,
+        reinit_reward_net: Optional[bool] = False,
+        fixed_train_set: Optional[bool] = False,
+        deterministic_label: Optional[bool] = False,
     ):
         """Initialize the preference comparison trainer.
 
@@ -909,16 +969,21 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         self.reward_trainer.logger = self.logger
         # the reward_trainer's model should refer to the same object as our copy
         assert self.reward_trainer.model is self.model
+
         self.trajectory_generator = trajectory_generator
         self.trajectory_generator.logger = self.logger
+
         self.fragmenter = fragmenter or RandomFragmenter(
             custom_logger=self.logger,
             seed=seed,
         )
         self.fragmenter.logger = self.logger
+
+        sample = not deterministic_label
         self.preference_gatherer = preference_gatherer or SyntheticGatherer(
             custom_logger=self.logger,
             seed=seed,
+            sample=sample
         )
         self.preference_gatherer.logger = self.logger
 
@@ -929,6 +994,11 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         self.initial_epoch_multiplier = initial_epoch_multiplier
 
         self.dataset = PreferenceDataset()
+        self.test_dataset = None
+        self.full_dataset_train = full_dataset_train
+        self.fixed_train_set = fixed_train_set
+        self.reinit_reward_net = reinit_reward_net
+        self.epoch_multiplier = epoch_multiplier
 
     def train(
         self,
@@ -961,43 +1031,57 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
                 f"total_comparisons={total_comparisons} is less than "
                 f"comparisons_per_iteration={self.comparisons_per_iteration}",
             )
+        if self.fixed_train_set:
+            iterations = 1
         timesteps_per_iteration, extra_timesteps = divmod(total_timesteps, iterations)
 
         reward_loss = None
         reward_accuracy = None
+        print('iterations', iterations)
 
         for i in range(iterations):
             ##########################
             # Gather new preferences #
             ##########################
-            num_pairs = self.comparisons_per_iteration
-            # If the number of comparisons per iterations doesn't exactly divide
-            # the desired total number of comparisons, we collect the remainder
-            # right at the beginning to pretrain the reward model slightly.
-            # WARNING: This means that slightly changing the total number of
-            # comparisons or the number of comparisons per iteration can
-            # significantly change the proportion of pretraining comparisons!
-            #
-            # In addition, we collect the comparisons specified via
-            # initial_comparison_frac.
-            if i == 0:
-                num_pairs += extra_comparisons + initial_comparisons
-            num_steps = math.ceil(
-                self.transition_oversampling * 2 * num_pairs * self.fragment_length,
-            )
-            self.logger.log(f"Collecting {num_steps} trajectory steps")
-            trajectories = self.trajectory_generator.sample(num_steps)
-            # This assumes there are no fragments missing initial timesteps
-            # (but allows for fragments missing terminal timesteps).
-            horizons = (len(traj) for traj in trajectories if traj.terminal)
-            self._check_fixed_horizon(horizons)
-            self.logger.log("Creating fragment pairs")
-            fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
-            with self.logger.accumulate_means("preferences"):
-                self.logger.log("gathering preferences")
-                preferences = self.preference_gatherer(fragments)
-            self.dataset.push(fragments, preferences)
-            self.logger.log(f"Dataset now contains {len(self.dataset)} samples")
+            if not self.fixed_train_set:
+                num_pairs = self.comparisons_per_iteration
+                # If the number of comparisons per iterations doesn't exactly divide
+                # the desired total number of comparisons, we collect the remainder
+                # right at the beginning to pretrain the reward model slightly.
+                # WARNING: This means that slightly changing the total number of
+                # comparisons or the number of comparisons per iteration can
+                # significantly change the proportion of pretraining comparisons!
+                #
+                # In addition, we collect the comparisons specified via
+                # initial_comparison_frac.
+                if i == 0:
+                    num_pairs += extra_comparisons + initial_comparisons
+                num_steps = math.ceil(
+                    self.transition_oversampling * 2 * num_pairs * self.fragment_length,
+                )
+                self.logger.log(f"Collecting {num_steps} trajectory steps")
+                trajectories = self.trajectory_generator.sample(num_steps)
+                # This assumes there are no fragments missing initial timesteps
+                # (but allows for fragments missing terminal timesteps).
+                horizons = (len(traj) for traj in trajectories if traj.terminal)
+                self._check_fixed_horizon(horizons)
+                self.logger.log("Creating fragment pairs")
+                fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
+                with self.logger.accumulate_means("preferences"):
+                    self.logger.log("gathering preferences")
+                    preferences = self.preference_gatherer(fragments)
+                self.dataset.push(fragments, preferences)
+                self.logger.log(f"Dataset now contains {len(self.dataset)} samples")
+
+            if self.full_dataset_train and len(self.dataset) < total_comparisons:
+                continue
+                
+            if self.reinit_reward_net:
+                def init_weights(m):
+                    if isinstance(m, th.nn.Linear):
+                        th.nn.init.xavier_uniform(m.weight)
+                        m.bias.data.fill_(0.01)
+                self.reward_trainer.model.apply(init_weights)
 
             ##########################
             # Train the reward model #
@@ -1005,18 +1089,22 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
 
             # On the first iteration, we train the reward model for longer,
             # as specified by initial_epoch_multiplier.
-            epoch_multiplier = 1.0
+            epoch_multiplier = self.epoch_multiplier
             if i == 0:
                 epoch_multiplier = self.initial_epoch_multiplier
 
             with self.logger.accumulate_means("reward"):
                 self.logger.log("Training reward model")
+                self.reward_trainer.model.train()
                 self.reward_trainer.train(
                     self.dataset,
                     epoch_multiplier=epoch_multiplier,
+                    test_dataset=self.test_dataset,
+                    logger=self.logger,
+                    callback=callback,
                 )
-            reward_loss = self.logger.name_to_value["mean/reward/loss"]
-            reward_accuracy = self.logger.name_to_value["mean/reward/accuracy"]
+            reward_loss = self.logger.name_to_value["mean/reward/train_loss"]
+            reward_accuracy = self.logger.name_to_value["mean/reward/train_accuracy"]
 
             ###################
             # Train the agent #
@@ -1031,13 +1119,14 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
                 self.logger.log(f"Training agent for {num_steps} timesteps")
                 self.trajectory_generator.train(steps=num_steps)
 
-            self.logger.dump(self._iteration)
-
             ########################
             # Additional Callbacks #
             ########################
             if callback:
                 callback(self._iteration)
             self._iteration += 1
+
+            self.logger.dump(self._iteration)
+
 
         return {"reward_loss": reward_loss, "reward_accuracy": reward_accuracy}

@@ -3,7 +3,17 @@
 import gym
 import numpy as np
 import pytest
-from seals.testing import envs as seals_test
+
+try:
+    # seals_test requires mujoco_py, so skip if we don't have that
+    from seals.testing import envs as seals_test
+except gym.error.DependencyNotInstalled as ex:
+    pytest.skip(
+        "skipping due to import error on seals.testing, mujoco_py is probably "
+        f"missing (error: {ex})",
+        allow_module_level=True,
+    )
+    seals_test = None
 from stable_baselines3.common import envs, vec_env
 
 # Unused imports is for side-effect of registering environments
@@ -19,7 +29,8 @@ ENV_NAMES = [
 DETERMINISTIC_ENVS = []
 
 
-env = pytest.fixture(seals_test.make_env_fixture(skip_fn=pytest.skip))
+if seals_test is not None:
+    env = pytest.fixture(seals_test.make_env_fixture(skip_fn=pytest.skip))
 
 
 @pytest.mark.parametrize("env_name", ENV_NAMES)
