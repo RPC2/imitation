@@ -75,7 +75,7 @@ setup(
             "stable-baselines3@git+https://github.com/carlosluis/stable-baselines3.git"
             "@gym_fixes#egg=stable-baselines3"
         ),
-        "stable-baselines3>=1.4.0",
+        "stable-baselines3>=1.2.1",
         # TODO(nora) switch back to PyPi once 0.8.3 makes it to release:
         "sacred@git+https://github.com/IDSIA/sacred.git@0.8.3",
         "tensorboard>=1.14",
